@@ -1,0 +1,755 @@
+---
+title: "lisaClust"
+author: "Ellis Patrick"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+    toc_depth: 3
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE, fig.path = "figures/", dev=c('png','pdf','svg'), message = FALSE, warning = FALSE)
+```
+
+```{r loadLibraries}
+# Load libraries
+
+library(spatstat)
+library(spicyR)
+library(lisaClust)
+library(pheatmap)
+library(paletteer)
+library(kohonen)
+library(BiocParallel)
+library(S4Vectors)
+library(scales)
+library(patchwork)
+library(fastcluster)
+library(tidyverse)
+library(factoextra)
+```
+
+## CODEX spleen
+
+### Process data
+```{r processCODEX, eval=FALSE}
+# Load data
+# Downloaded from https://data.mendeley.com/datasets/zjnpwh8m5b/1
+cells <- read.csv('/dskh/nobackup/biostat/datasets/spatial/CODEX_Spleen_Goltsev2018/Data/Suppl.Table2.CODEX_paper_MRLdatasetexpression.csv')
+cellAnnoXL <- as.data.frame(readxl::read_xlsx('/dskh/nobackup/biostat/datasets/spatial/CODEX_Spleen_Goltsev2018/Data/mmc2.xlsx',sheet =1))
+
+# Focus on BALBc-1
+cells <- cells[grep('BALBc-1',cells$sample_Xtile_Ytile), ]
+cells$frame <- unlist(lapply(strsplit(as.character(cells$sample_Xtile_Ytile),'_'),function(x)paste(x[2:3],collapse = '_')))
+cells$Xtile <- unlist(lapply(strsplit(cells$frame,''),function(x)as.numeric(x[3])))
+cells$Ytile <- unlist(lapply(strsplit(cells$frame,''),function(x)as.numeric(x[7])))
+
+# Remove gap from stitching
+cells$x <- cells$X.X + 1342*(cells$Xtile-1)
+cells$y <- cells$Y.Y + 1006*(cells$Ytile-1)
+
+# Extract cell-type information
+cellAnno <- cellAnnoXL[,"Imaging phenotype (cell type)"]
+names(cellAnno) <- cellAnnoXL[,"X-shift cluster ID"]
+cellAnno[cellAnno %in% c('dirt','noid')] <- NA
+cells$cellType <- cellAnno[as.character(cells$Imaging.phenotype.cluster.ID)]
+cells <- cells %>% dplyr::filter(!is.na(cellType))
+cells <- dplyr::filter(cells, cellType != 'CD106(-)CD16/32(-)Ly6C(+)CD31(+) stroma')
+cells <- dplyr::filter(cells, !(x>9250 & y>7200))
+
+# Make SegmentedCells object and save
+cellExpCODEX <- SegmentedCells(cells, cellTypeString = 'cellType')
+save(cellExpCODEX, file = "Data/cellExpCODEX.RData")
+```
+
+```{r loadCODEX}
+load("Data/cellExpCODEX.RData")
+```
+
+### Calculate LISA curves
+
+```{r curvesCODEX}
+# Set range of rs
+rmax = 1000
+Rs <- seq(20,rmax,length.out = 20)
+Rs <- c(20,50,100,200) 
+
+
+# Calculate lisa
+t1 <- Sys.time()
+lisaCurvesCODEX <- lisa(cellExpCODEX, Rs = Rs, window = "convex")#, sigma = 20)#, BPPARAM = BiocParallel::MulticoreParam(25))#, whichParallel = "cellType")  
+t2 <- Sys.time()
+t2-t1
+
+# Save curves
+#save(lisaCurvesCODEX, file = "Data/lisaCurves.CODEX.2.RData")
+```
+
+<!-- ```{r} -->
+<!-- load("Data/lisaCurves.CODEX.2.RData") -->
+<!-- ``` -->
+
+### Cluster LISA
+
+```{r clusterCODEX}
+curves <- lisaCurvesCODEX
+curves[is.na(curves)] <- 0
+
+set.seed(51773)
+kM <- kmeans(curves,4, iter.max = 10000)
+reg <- paste('r',kM$cluster,sep = '')
+region(cellExpCODEX) <- reg
+
+```
+
+### Plot regions
+
+```{r regionDraft, results='hide'}
+# Calculate over representation of cellTypes in each region
+
+tab <- table(cellType(cellExpCODEX),region(cellExpCODEX, annot = FALSE)[,1])
+tab = tab/rowSums(tab)%*%t(colSums(tab))*sum(tab)
+ph <- pheatmap(pmin(tab,3))
+
+paletteer_d("ggthemes::few_Light")
+
+breaks <- c(names(which.max(tab['erythroblasts',])), names(which.max(tab['FDCs',])), names(which.max(tab['CD4(+) T cells',])), names(which.max(tab['marginal zone mphs',])))#, names(which.max(tab['capsule',])))
+
+```
+
+
+```{r tissue, fig.height = 6, fig.width = 7}
+
+colours <- paletteer_d("ggthemes::few_Light")[c(9,4,2,3)]
+names(colours) = breaks
+zones <- c("Red pulp", "Lymph follicles", "PALS", "Marginal zone")#, "Marginal zone 2")
+names(zones) = breaks
+zones2 <- c("Red pulp cells", "Lymph follicles cells", "PALS cells", "Marginal zone cells")#, "Marginal zone 2 cells")
+names(zones2) <- breaks
+
+# ggplot(region(cellExpCODEX, annot = TRUE), aes(x,y,colour = factor(region, levels = names(zones)))) + geom_point() + scale_color_manual(values = colours, labels = zones) + labs(colour = "region")
+# ggplot(region(cellExpCODEX, annot = TRUE), aes(x,y,colour = region)) + geom_point()
+
+cellRegion = as.character(cellType(cellExpCODEX))
+# Red pulp region 2
+
+cellRegion[cellType(cellExpCODEX) %in% c('plasma cells', 'erythroblasts')] <- breaks[1]
+# Lymph follicles
+cellRegion[cellType(cellExpCODEX) %in% c('FDCs')] <- breaks[2]
+# PALS
+cellRegion[cellType(cellExpCODEX) %in% c("CD8(+) T cells")] <- breaks[3]
+# Marginal zone 1
+cellRegion[cellType(cellExpCODEX) %in% c('marginal zone mphs')] <- breaks[4]
+# Marginal zone 2
+#cellRegion[cellType(cellExpCODEX) %in% c("capsule")] <- breaks[5]
+
+
+df <- region(cellExpCODEX, annot = TRUE)
+df$cellRegion <- factor(cellRegion, levels = breaks)
+
+
+hatch <- c(1,2,3,4)
+names(hatch) <- names(zones)
+
+p1 <- ggplot(df, aes(x,y,colour = factor(cellRegion, levels = names(zones)), region = factor(region, levels = names(zones)))) + geom_point(data = dplyr::filter(df, cellRegion == breaks[4]), size = 0.9) + geom_point(data = dplyr::filter(df, cellRegion == breaks[1]), size = 0.9) + geom_point(data = dplyr::filter(df, cellRegion == breaks[2]), size = 0.9) + geom_point(data = dplyr::filter(df, cellRegion == breaks[6]), size = 0.9) + geom_point(data = dplyr::filter(df, cellRegion == breaks[3]), size = 0.9) + geom_point(data = dplyr::filter(df, cellRegion == breaks[5]), size = 0.9) + scale_color_manual(values = colours, labels = zones2, name = "Region-enriched cells") + geom_hatching(window = 'convex', line.spacing = 41) + scale_region_manual(values = hatch, labels = zones, name = "Regions") + theme_minimal()
+
+p1
+
+```
+
+
+### Plot cell enrichment for each region
+
+```{r cellRegionHeatmap, fig.height = 7, fig.width = 9}
+annotation_col <- data.frame(Regions = zones) 
+rownames(annotation_col) <- names(zones)
+
+annotation_row <- dplyr::select(df, cellType, cellRegion) %>% unique() %>% mutate(`Region cells` = zones2[cellRegion])
+rownames(annotation_row) <- annotation_row[,1]
+annotation_row <- dplyr::select(annotation_row,`Region cells`)
+
+rowColours <- colours
+names(rowColours) <- zones2
+colours2 <- colours
+names(colours2) <- annotation_col[names(colours),1]
+annotation_colors  = list(Regions = colours2, `Region cells`  = rowColours)
+
+ph <- pheatmap(pmin(tab,3), annotation_row = annotation_row, annotation_col = annotation_col, annotation_colors = annotation_colors)
+
+```
+
+
+### Optimal number of clusters
+
+
+
+```{r CODEXelbow, fig.height = 4, fig.width = 5}
+
+set.seed(51773)
+u <- sample(seq_len(nrow(curves)),5000)
+fvis <- fviz_nbclust(curves[u,], kmeans, method = "wss")+
+  labs(subtitle = "Elbow method")
+fvis + geom_vline(xintercept = 3, linetype = 2)
+# fviz_nbclust(curves[u,], kmeans, method = "gap")+
+#   labs(subtitle = "Gap method")
+# fviz_nbclust(curves, kmeans, method = "silhouette")+
+#   labs(subtitle = "Silhouette method")
+
+```
+
+
+
+### Compare different clustering methods
+
+#### SOM
+
+```{r tissueSOMplain, fig.height = 6, fig.width = 7}
+cellExpSOM <- cellExpCODEX
+
+
+curves <- lisaCurvesCODEX
+curves[is.na(curves)] <- 0
+
+set.seed(51773)
+grid.size <- 10
+som.grid <- somgrid(xdim = grid.size, ydim = grid.size, topo = 'hexagonal', toroidal = T)
+
+som.curves <- som(curves, grid = som.grid)
+
+
+somC <- kmeans(som.curves$codes[[1]], centers = 4, iter.max = 20)$cluster
+
+reg <- paste('r',somC[som.curves$unit.classif] ,sep = '')
+region(cellExpSOM) <- reg
+
+
+ggplot(region(cellExpSOM, annot = TRUE), aes(x,y,colour = region)) + geom_point() + theme_classic() + labs(title = "SOM")
+
+
+
+```
+
+```{r tissueSOMhatched, fig.height = 6, fig.width = 7}
+df <- region(cellExpSOM, annot = TRUE)
+df$cellRegion <- factor(cellRegion, levels = breaks)
+
+names(zones) <- c("r2", "r1", "r4", "r3")
+hatch <- c(1,2,3,4)
+names(hatch) <- names(zones)
+
+pSOM <- ggplot(df, aes(x,y,colour = factor(cellRegion, levels = names(zones)), region = factor(region, levels = names(zones)))) + geom_point(data = dplyr::filter(df, cellRegion == breaks[4]), size = 0.9) + geom_point(data = dplyr::filter(df, cellRegion == breaks[1]), size = 0.9) + geom_point(data = dplyr::filter(df, cellRegion == breaks[2]), size = 0.9) + geom_point(data = dplyr::filter(df, cellRegion == breaks[6]), size = 0.9) + geom_point(data = dplyr::filter(df, cellRegion == breaks[3]), size = 0.9) + geom_point(data = dplyr::filter(df, cellRegion == breaks[5]), size = 0.9) + scale_color_manual(values = colours, labels = zones2, name = "Region-enriched cells") + geom_hatching(window = 'convex', line.spacing = 41) + scale_region_manual(values = hatch, labels = zones, name = "Regions") + theme_minimal() + labs(title = "SOM")
+
+
+
+```
+
+
+```{r cellExpHCODEX_SOM_heatmap, fig.width=5, fig.height=9}
+tab <- table(cellType(cellExpSOM),region(cellExpSOM, annot = FALSE)[,1])
+tab = tab/rowSums(tab)%*%t(colSums(tab))*sum(tab)
+ph <- pheatmap(pmin(tab,1.5))
+```
+
+#### Hierarchical clustering
+
+```{r clusterCODEXhclust, eval = FALSE}
+
+
+
+set.seed(51773)
+u <- sample(seq_len(nrow(curves)),10000)
+
+curves <- lisaCurvesCODEX#[u, ]
+curves[is.na(curves)] <- 0
+
+set.seed(51773)
+hC <- hclust(dist(curves), method = "ward.D2")
+
+save(hC, file = "hclustCODEX.RData")
+
+```
+
+```{r tissueHCLUSTplain, fig.height = 6, fig.width = 7}
+
+load("hclustCODEX.RData")
+
+cellExpHC <- cellExpCODEX
+clust <- cutree(hC,4)
+
+
+reg <- paste('r',clust,sep = '')
+
+region(cellExpHC) <- reg
+
+
+ggplot(region(cellExpHC, annot = TRUE), aes(x,y,colour = region)) + geom_point() + labs(title = "hclust") + theme_classic()
+
+```
+
+```{r tissueHCLUSThatched, fig.height = 6, fig.width = 7}
+df <- region(cellExpHC, annot = TRUE)
+df$cellRegion <- factor(cellRegion, levels = breaks)
+
+names(zones) <- c("r1", "r4", "r2", "r3")
+hatch <- c(1,2,3,4)
+names(hatch) <- names(zones)
+
+pHCLUST <- ggplot(df, aes(x,y,colour = factor(cellRegion, levels = names(zones)), region = factor(region, levels = names(zones)))) + geom_point(data = dplyr::filter(df, cellRegion == breaks[4]), size = 0.9) + geom_point(data = dplyr::filter(df, cellRegion == breaks[1]), size = 0.9) + geom_point(data = dplyr::filter(df, cellRegion == breaks[2]), size = 0.9) + geom_point(data = dplyr::filter(df, cellRegion == breaks[6]), size = 0.9) + geom_point(data = dplyr::filter(df, cellRegion == breaks[3]), size = 0.9) + geom_point(data = dplyr::filter(df, cellRegion == breaks[5]), size = 0.9) + scale_color_manual(values = colours, labels = zones2, name = "Region-enriched cells") + geom_hatching(window = 'convex', line.spacing = 41) + scale_region_manual(values = hatch, labels = zones, name = "Regions") + theme_minimal() + labs(title = "Hierarchical")
+
+#pdf(file = 'tissue.pdf', height = 6, width = 7)
+
+
+```
+
+#### CLARA
+
+```{r tissueCLARAplain, fig.height = 6, fig.width = 7}
+cellExpCLARA <- cellExpCODEX
+
+
+curves <- lisaCurvesCODEX
+curves[is.na(curves)] <- 0
+
+library(cluster)
+
+clara.res <- clara(curves, 4, samples = 50, pamLike = TRUE)
+
+
+reg <- paste('r', clara.res$clustering, sep = '')
+region(cellExpCLARA) <- reg
+
+
+ggplot(region(cellExpCLARA, annot = TRUE), aes(x,y,colour = region)) + geom_point() + labs(title = "CLARA") + theme_classic()
+
+
+
+```
+
+```{r tissueCLARAhatched, fig.height = 6, fig.width = 7}
+df <- region(cellExpCLARA, annot = TRUE)
+df$cellRegion <- factor(cellRegion, levels = breaks)
+
+names(zones) <- c("r2", "r4", "r1", "r3")
+hatch <- c(1,2,3,4)
+names(hatch) <- names(zones)
+
+pCLARA <- ggplot(df, aes(x,y,colour = factor(cellRegion, levels = names(zones)), region = factor(region, levels = names(zones)))) + geom_point(data = dplyr::filter(df, cellRegion == breaks[4]), size = 0.9) + geom_point(data = dplyr::filter(df, cellRegion == breaks[1]), size = 0.9) + geom_point(data = dplyr::filter(df, cellRegion == breaks[2]), size = 0.9) + geom_point(data = dplyr::filter(df, cellRegion == breaks[6]), size = 0.9) + geom_point(data = dplyr::filter(df, cellRegion == breaks[3]), size = 0.9) + geom_point(data = dplyr::filter(df, cellRegion == breaks[5]), size = 0.9) + scale_color_manual(values = colours, labels = zones2, name = "Region-enriched cells") + geom_hatching(window = 'convex', line.spacing = 41) + scale_region_manual(values = hatch, labels = zones, name = "Regions") + theme_minimal() + labs(title = "CLARA")
+
+#pdf(file = 'tissue.pdf', height = 6, width = 7)
+
+
+```
+
+
+```{r compareMethodsCodex, fig.height = 10, fig.width = 13}
+pKmeans <- p1 + labs(title = "k-means")
+
+(pKmeans + pCLARA) / (pHCLUST + pSOM)
+```
+
+
+
+
+### Compare different r
+
+```{r compareRCodex, fig.height = 10, fig.width = 10}
+df <- region(cellExpCODEX, annot = TRUE)
+df$cellRegion <- factor(cellRegion, levels = breaks)
+
+
+# 20
+curves <- lisaCurvesCODEX[, grep("20_",colnames(lisaCurvesCODEX))]
+curves[is.na(curves)] <- 0
+
+set.seed(51773)
+kM <- kmeans(curves,4, iter.max = 10000)
+reg <- paste('r',kM$cluster,sep = '')
+region(cellExpCODEX) <- reg
+
+p20 <- ggplot(region(cellExpCODEX, annot = TRUE), aes(x,y,colour = region)) + geom_point(size = 0.5) + labs(title = "r = 20") #+ geom_hatching(data = df,aes(region = region), window = 'convex', line.spacing = 41) + scale_region_manual(values = hatch, labels = zones, name = "Regions") 
+
+
+# 50
+curves <- lisaCurvesCODEX[, grep("50_",colnames(lisaCurvesCODEX))]
+curves[is.na(curves)] <- 0
+
+set.seed(51773)
+kM <- kmeans(curves,4, iter.max = 10000)
+reg <- paste('r',kM$cluster,sep = '')
+region(cellExpCODEX) <- reg
+
+p50 <- ggplot(region(cellExpCODEX, annot = TRUE), aes(x,y,colour = region)) + geom_point(size = 0.5) + labs(title = "r = 50")
+
+
+# 100
+curves <- lisaCurvesCODEX[, grep("100_",colnames(lisaCurvesCODEX))]
+curves[is.na(curves)] <- 0
+
+set.seed(51773)
+kM <- kmeans(curves,4, iter.max = 10000)
+reg <- paste('r',kM$cluster,sep = '')
+region(cellExpCODEX) <- reg
+
+p100 <- ggplot(region(cellExpCODEX, annot = TRUE), aes(x,y,colour = region)) + geom_point(size = 0.5) + labs(title = "r = 100")
+
+
+# 200
+
+cellExpCODEX.200 <- cellExpCODEX
+curves <- lisaCurvesCODEX[, grep("200_",colnames(lisaCurvesCODEX))]
+curves[is.na(curves)] <- 0
+
+set.seed(51773)
+kM <- kmeans(curves,4, iter.max = 10000)
+reg <- paste('r',kM$cluster,sep = '')
+region(cellExpCODEX.200) <- reg
+
+p200 <- ggplot(region(cellExpCODEX.200, annot = TRUE), aes(x,y,colour = region)) + geom_point(size = 0.5) + labs(title = "r = 200")
+
+(p20 + p50)/(p100 + p200)
+
+
+
+
+p200.2 <- ggplot(df, aes(x,y,colour = factor(cellRegion, levels = names(zones)), region = factor(region, levels = names(zones)))) + geom_point(data = dplyr::filter(df, cellRegion == breaks[4]), size = 0.9) + geom_point(data = dplyr::filter(df, cellRegion == breaks[1]), size = 0.9) + geom_point(data = dplyr::filter(df, cellRegion == breaks[2]), size = 0.9) + geom_point(data = dplyr::filter(df, cellRegion == breaks[6]), size = 0.9) + geom_point(data = dplyr::filter(df, cellRegion == breaks[3]), size = 0.9) + geom_point(data = dplyr::filter(df, cellRegion == breaks[5]), size = 0.9) + scale_color_manual(values = colours, labels = zones2, name = "Region-enriched cells") + geom_hatching(data = region(cellExpCODEX.200, annot = TRUE), aes(x,y,region = region), window = 'convex', line.spacing = 41) + labs(region = "Regions") + theme_minimal()
+
+
+```
+
+
+
+
+
+
+
+
+## HDST olfactory bulb
+
+### Process data
+
+```{r processHDST, eval=FALSE}
+assignments <- readxl::read_xlsx('/dskh/nobackup/biostat/datasets/spatial/HDST_Cortex_Vickovic2019/Data/41592_2019_548_MOESM7_ESM.xlsx', skip = 1) %>% as.data.frame()
+
+cells <- assignments %>% mutate(cellType = `Primary cell type`)
+
+cells <- cells %>% mutate(xOrig = x, yOrig = y)
+cells$y[cells$y < 260] = cells$y[cells$y < 260] - max(cells$y[cells$y < 260]) + min(cells$y[cells$y > 260])
+cells$y[cells$y > 525] = cells$y[cells$y > 525] - min(cells$y[cells$y > 525]) + max(cells$y[cells$y < 525])
+
+cells$x <- round(cells$x)
+cells$y <- round(cells$y)
+
+cellExpHDST <- SegmentedCells(cells)
+save(cellExpHDST, file = "Data/cellExpHDST.RData")
+```
+
+```{r loadHDST}
+load("Data/cellExpHDST.RData")
+```
+
+
+```{r densityHDST}
+
+df <- as.data.frame(cellSummary(cellExpHDST))
+
+p1 <- ggplot(df,aes(x = x,y = y)) + geom_point(size = 0.5, colour = "grey80", show.legend = FALSE)+geom_point(data = dplyr::filter(df, cellType == 'OBNBL1_Neurons_90'),show.legend = FALSE, colour = "#17706e", size = 1)+geom_point(data = dplyr::filter(df, cellType == 'OBINH1_Neurons_119'),show.legend = FALSE, colour = "#fb7813", size = 1) + theme_minimal() + theme(axis.title.y=element_blank(),axis.text.y=element_blank())
+
+p2 <- ggplot(df,aes(y = y)) + geom_density(fill = "grey60", alpha = 0.5, colour = "white") + theme_minimal() + scale_x_reverse()+ theme(axis.text.x=element_blank())
+
+ow <- spicyR:::makeWindow(df, window = "concave", window.length = 0.5)
+pp <- spatstat.geom::ppp(df$x, df$y, window = ow)
+d <- density(pp, sigma = 40)
+x <- rep(d$xcol, rep(length(d$xcol),length(d$yrow)))
+y <- rep(d$yrow, length(d$xcol))
+df <- data.frame(x,y,density = as.numeric(d$v))
+
+p3 <- ggplot(df,aes(x,y,fill = density)) + geom_raster()+
+  scale_fill_gradientn(colours=cm.colors(100), na.value = 0) + theme_minimal() + theme(axis.text.y=element_blank(),axis.title.y=element_blank())
+
+
+```
+
+### Calculate LISA curves
+
+```{r curvesHDST}
+
+set.seed(51773)
+#cellExpHDST <- dplyr::filterCells(cellExpHDST, cellID(cellExpHDST)%in%sample(cellID(cellExpHDST),10000, prob = 1/table(cellType(cellExpHDST))[cellType(cellExpHDST)]))
+
+rmax = 50
+# Rs <- seq(10,rmax,10)
+# Rs <- c(20,30,40,50)
+Rs <- (3:10)^2
+
+t1 <- Sys.time()
+lisaCurvesHDST <- lisa(cellExpHDST,Rs, window = 'concave', window.length = 0.5)#, window.length = 10, BPPARAM=BiocParallel::MulticoreParam(63), whichParallel = "cellType")  
+t2 <- Sys.time()
+t2-t1
+
+t1 <- Sys.time()
+  lisaCurves.inhomHDST <- lisa(cellExpHDST,Rs, window = 'concave', sigma = 20, window.length = 0.5)#, window.length = 10, BPPARAM=BiocParallel::MulticoreParam(63), whichParallel = "cellType", sigma = 20)  
+  t2 <- Sys.time()
+t2-t1
+  
+```
+
+### Cluster LISA curves
+
+```{r clusterHDST}
+
+curves <- lisaCurvesHDST
+curves[is.na(curves)] <- 0
+
+set.seed(51773)
+kM <- kmeans(curves,3, iter.max = 10000)
+reg <- paste('r',kM$cluster,sep = '')
+region(cellExpHDST) <- reg
+
+ggplot(region(cellExpHDST, annot = TRUE), aes(x,y,colour = region)) + geom_point() + labs(title = "15")
+
+
+```
+
+
+
+```{r HDSThatched}
+
+df <- region(cellExpHDST, annot = TRUE)
+p4 <- ggplot(df,aes(x = x,y = y, region = region)) + geom_point(size = 0.5, colour = "grey80", show.legend = FALSE)+geom_point(data = dplyr::filter(df, cellType == 'OBNBL1_Neurons_90'),show.legend = FALSE, colour = "#17706e", size = 1)+geom_point(data = dplyr::filter(df, cellType == 'OBINH1_Neurons_119'),show.legend = FALSE, colour = "#fb7813", size = 1) + theme_minimal() +  theme(axis.title.y=element_blank(),axis.text.y=element_blank()) + geom_hatching(hatching.colour = "#2B1608", window = "concave", show.legend = TRUE, line.width = 2.5, line.spacing = 16, window.length = 0.5) + scale_region_manual(values = c(2,1,3))#c(6,2,3,7,1))
+
+
+```
+
+### Plot cell type enrichment for each region
+
+
+```{r cellExpHDST_heatmap, fig.height=8, fig.width = 5}
+tab <- table(cellType(cellExpHDST),region(cellExpHDST, annot = FALSE)[,1])
+tab = tab/rowSums(tab)%*%t(colSums(tab))*sum(tab)
+ph <- pheatmap(pmin(tab,1.5))
+```
+
+
+
+
+### Cluster inhomogeneous LISA curves
+
+
+```{r clusterHDSTinhom}
+
+curves <- lisaCurves.inhomHDST
+curves[is.na(curves)] <- 0
+
+set.seed(51773)
+kM <- kmeans(curves,3, iter.max = 10000)
+reg <- paste('r',kM$cluster,sep = '')
+region(cellExpHDST) <- reg
+
+ggplot(region(cellExpHDST, annot = TRUE), aes(x,y,colour = region)) + geom_point()
+
+```
+
+
+
+
+```{r HDSThatchInhom}
+
+df <- region(cellExpHDST, annot = TRUE)
+
+p5 <- ggplot(df,aes(x = x,y = y, region = region)) + geom_point(size = 0.5, colour = "grey80", show.legend = FALSE)+geom_point(data = dplyr::filter(df, cellType == 'OBNBL1_Neurons_90'),show.legend = FALSE, colour = "#17706e", size = 1)+geom_point(data = dplyr::filter(df, cellType == 'OBINH1_Neurons_119'),show.legend = FALSE, colour = "#fb7813", size = 1) + theme_minimal() +  theme(axis.title.y=element_blank(),axis.text.y=element_blank()) + geom_hatching(hatching.colour = "#2B1608", window = "concave", show.legend = TRUE, line.width = 2.5, line.spacing = 16, window.length = 0.5) + scale_region_manual(values = c(2,1,3))#c(6,2,3,7,1))
+
+```
+
+
+### Plot cell type enrichment for each region for inhom curves
+
+
+
+```{r cellExpHDST_heatmap_inhom, fig.height=8, fig.width = 5}
+tab <- table(cellType(cellExpHDST),region(cellExpHDST, annot = FALSE)[,1])
+tab = tab/rowSums(tab)%*%t(colSums(tab))*sum(tab)
+ph <- pheatmap(pmin(tab,1.5))
+
+```
+
+### Plot everything together
+
+```{r brain, fig.height=10, fig.width = 13}
+pNULL <- ggplot() + theme_void()
+p2 + p1 + p3 + pNULL + p4 + p5 + plot_layout(widths = c(0.1,1, 1), ncol = 3)
+
+
+# pdf("brain.pdf", height = 10, width = 13)
+# p2 + p1 + p3 + pNULL + p4 + p5 + plot_layout(widths = c(0.1,1, 1), ncol = 3)
+# dev.off()
+```
+
+### Plot multiple radii
+
+
+```{r HDSTmultiple, fig.height=12, fig.width=12}
+
+curves <- lisaCurves.inhomHDST
+curves[is.na(curves)] <- 0
+
+set.seed(51773)
+kM <- kmeans(curves,3, iter.max = 10000)
+reg <- paste('r',kM$cluster,sep = '')
+region(cellExpHDST) <- reg
+dfAll <- region(cellExpHDST, annot = TRUE)
+
+plots <- sapply(Rs,function(x){
+curves <- lisaCurves.inhomHDST[, grep(paste0("^",x,"_"), colnames(lisaCurves.inhomHDST))]
+curves[is.na(curves)] <- 0
+
+set.seed(51773)
+kM <- kmeans(curves,3, iter.max = 10000)
+reg <- paste('r',kM$cluster,sep = '')
+region(cellExpHDST) <- reg
+df <- region(cellExpHDST, annot = TRUE)
+
+ggplot(df,aes(x = x,y = y, colour = region)) + geom_point(size = 0.5, show.legend = FALSE) + theme_minimal() +  theme(axis.title.y=element_blank(),axis.text.y=element_blank()) + geom_hatching(data = dfAll, aes(region = region), hatching.colour = "#2B1608", window = "concave", show.legend = TRUE, line.width = 2.5, line.spacing = 30, window.length = 0.02) + scale_region_manual(values = c(2,1,3)) + labs(title = paste0("r = ",x))
+}
+, simplify = FALSE)
+
+
+p6 <- p5 +  labs(title = "r = 9, 16, 25, 36, 49, 64, 81 and 100")
+p7 <- p6 + plots[[1]] + plots[[2]] + plots[[3]] + plots[[4]] + plots[[5]] + plots[[6]] + plots[[7]] + plots[[8]] + plot_layout(nrow = 3)
+
+p7
+```
+
+
+
+## IMC diabetes
+
+### Process data
+
+
+```{r processIMC, eval=FALSE}
+
+# Read in datasets.
+allCells <- read.csv("/dskh/nobackup/biostat/datasets/spatial/IMC_Diabetes_Damond2019/Data/All_Cells.csv")
+celltype <- read.csv("/dskh/nobackup/biostat/datasets/spatial/IMC_Diabetes_Damond2019/Data/CellTypes.csv")
+meta <- read.csv('/dskh/nobackup/biostat/datasets/spatial/IMC_Diabetes_Damond2019/Data/Metadata.csv')
+
+# Clean celltype
+celltype <- celltype %>%
+  mutate(imageID = core, ImageNumber = as.numeric(as.factor(celltype$core)), imageCellID = id, ObjectNumber = as.numeric(lapply(strsplit(id,"_"),function(x)x[2])), cellType = factor(CellType))
+
+cells <- allCells %>%
+  mutate(x = AreaShape_Center_X, y = AreaShape_Center_Y) %>%
+  select(x,y,ImageNumber, ObjectNumber, starts_with("Intensity_MeanIntensity_CleanStack_"), starts_with("AreaShape_")) %>%
+  inner_join(celltype, by = c("ImageNumber", "ObjectNumber"))
+
+cellExpIMC <- SegmentedCells(cells, intensityString = "Intensity_MeanIntensity_CleanStack_", morphologyString = "AreaShape_")
+
+meta$stage <- factor(as.character(meta$stage),levels = c("Non-diabetic", "Onset", "Long-duration"))
+meta <- meta %>% mutate(imageID = image) %>% select(-image)
+
+imagePheno(cellExpIMC) <- meta
+
+save(cellExpIMC, file = "Data/cellExpIMC.RData")
+
+```
+
+
+```{r loadIMC}
+load("Data/cellExpIMC.RData")
+```
+
+
+### Calculate LISA curves
+
+```{r curvesIMC}
+
+Rs <- c(20, 50, 100)
+
+ t7 = Sys.time()
+
+lisaCurvesIMC <- lisa(cellExpIMC,Rs, BPPARAM = BiocParallel::MulticoreParam(50), whichParallel = "imageID", window = "convex", sigma = 20)  
+  
+t8 = Sys.time()
+t8 - t7
+
+
+```
+### Cluster LISA curves
+
+
+```{r clusterIMC}
+
+curves <- lisaCurvesIMC
+curves[is.na(curves)] <- 0
+
+set.seed(51773)
+nClust <- 4
+kM <- kmeans(curves,nClust, iter.max = 10000)
+region(cellExpIMC) <-  factor(paste('r',kM$cluster,sep = ''), levels = paste('r',1:nClust,sep = ''))
+
+```
+
+
+### Plot cell type enrichment for each region
+
+
+
+```{r heatmapIMC}
+
+tab <- table(cellType(cellExpIMC),region(cellExpIMC)[,1])
+tab = tab/rowSums(tab)%*%t(colSums(tab))*sum(tab)
+
+ph <- pheatmap(pmax(pmin(tab,2.5),0.4), cluster_cols = FALSE)
+
+
+p1 <- tab %>%
+  as.data.frame() %>%
+  mutate(cellType = factor(Var1, levels = levels(Var1)[ph$tree_row$order]), region = Var2, Freq2 = pmax(pmin(Freq,2),0.5)) %>%
+  ggplot(aes(x = region, y = cellType, colour = Freq2, size = Freq)) + geom_point() + scale_colour_gradient2(breaks = c(0.5,1,1.5,2), low ="#4575B4", mid = "white", high = "#D73027", midpoint = 1) + theme_minimal() + labs(x = "Region", y = "Cell-type", colour = "Relative\nFrequency", size = "Relative\nFrequency")
+
+```
+### Plot proportions of regions in healthy vs diabetes
+
+```{r IMCplot, fig.height = 7, fig.width = 5}
+
+data <- region(cellExpIMC, annot = TRUE)
+data <- left_join(data, imagePheno(cellExpIMC), by = "imageID")
+
+dfs <- data  %>% count(stage, region, case) %>%
+  group_by(case) %>%
+  mutate(prop = n/sum(n)) %>%
+  ungroup() %>%
+  group_by(stage, region) %>%
+  summarise(dmin = min(prop), dmax = max(prop), prop = mean(prop))
+dfs$stage = factor(as.character(dfs$stage),levels = c("Non-diabetic", "Onset", "Long-duration"))
+
+
+df <- data  %>% count(stage, region, case) %>%
+  group_by(case) %>%
+  mutate(prop = n/sum(n)) %>%
+  ungroup()
+df$stage = factor(as.character(df$stage),levels = c("Non-diabetic", "Onset", "Long-duration"))
+
+p2 <- df %>% ggplot(aes(x = region, y = prop, fill = stage, colour = stage)) + 
+  geom_boxplot(data = dfs, alpha = 0.1, aes(upper = dmax, lower = dmin, ymin = dmin, ymax = dmax, middle = dmax, fill = stage, x = region, group = interaction(stage,region)), stat = "identity", position=position_dodge(width=0.75), width = 0.75, colour = "white") + 
+  geom_point(position = position_dodge(0.75)) + theme_classic() +
+  labs(x = "Region", y = "Proportion", colour = "Stage", fill = "Stage")
+
+#p2/p1 + plot_layout(height = c(1, 1.5))
+
+```
+
+
+
+```{r IMCplotHoriz, fig.height=4, fig.width=9}
+p3 <- p2 + coord_flip() + theme(legend.position= c(0.9, 0.8))
+p4 <- p1 + coord_flip() + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + theme(legend.position="left")
+p4 + p3 + plot_layout(width = c(3, 3))
+
+```
+
+
